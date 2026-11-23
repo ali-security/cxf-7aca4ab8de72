@@ -23,6 +23,11 @@ import java.io.StringReader;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import javax.security.auth.callback.Callback;
 import javax.security.auth.callback.CallbackHandler;
@@ -45,9 +50,12 @@ import org.apache.cxf.ws.security.tokenstore.MemoryTokenStore;
 import org.apache.cxf.ws.security.tokenstore.SecurityToken;
 import org.apache.cxf.ws.security.tokenstore.TokenStore;
 import org.apache.ws.security.WSConstants;
+import org.apache.ws.security.WSDocInfo;
+import org.apache.ws.security.WSSConfig;
 import org.apache.ws.security.WSSecurityException;
 import org.apache.ws.security.components.crypto.Crypto;
 import org.apache.ws.security.components.crypto.CryptoFactory;
+import org.apache.ws.security.handler.RequestData;
 import org.apache.ws.security.message.token.BinarySecurity;
 import org.apache.ws.security.message.token.SecurityContextToken;
 import org.apache.ws.security.message.token.UsernameToken;
@@ -60,14 +68,105 @@ import org.apache.ws.security.saml.ext.builder.SAML2Constants;
 import org.apache.ws.security.validate.Credential;
 import org.easymock.EasyMock;
 import org.junit.Assert;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.opensaml.common.SAMLVersion;
 
 /**
  * The STSTokenValidator caches the token that the STS returns for a validated token. A different
  * (not validated) token must never be mapped to a cached result, e.g. via a hash collision.
+ *
+ * It also tests the local validation of SAML Assertions in the STSTokenValidator.
  */
 public class STSTokenValidatorTest extends Assert {
+
+    private static Crypto signingCrypto;
+    private static Crypto trustedCrypto;
+    private static Crypto untrustedCrypto;
+
+    @BeforeClass
+    public static void init() throws Exception {
+        WSSConfig.init();
+        signingCrypto = CryptoFactory.getInstance("outsecurity.properties");
+        // Contains the signing certificate
+        trustedCrypto = CryptoFactory.getInstance("outsecurity.properties");
+        // Only trusts an unrelated CA
+        untrustedCrypto = CryptoFactory.getInstance("cxfca.properties");
+    }
+
+    @Test
+    public void testTrustedSignedAssertion() throws Exception {
+        STSTokenValidator validator = new STSTokenValidator();
+        RequestData data = createRequestData(trustedCrypto);
+        assertTrue(validator.isValidatedLocally(createCredential(true, data), data));
+    }
+
+    @Test
+    public void testUntrustedSignedAssertion() throws Exception {
+        STSTokenValidator validator = new STSTokenValidator();
+        RequestData data = createRequestData(untrustedCrypto);
+        assertFalse(validator.isValidatedLocally(createCredential(true, data), data));
+    }
+
+    /**
+     * An unsigned Assertion must not be treated as validated locally because a previous
+     * signed Assertion was trusted.
+     */
+    @Test
+    public void testUnsignedAssertionAfterTrustedAssertion() throws Exception {
+        STSTokenValidator validator = new STSTokenValidator();
+
+        RequestData trustedData = createRequestData(trustedCrypto);
+        assertTrue(validator.isValidatedLocally(createCredential(true, trustedData), trustedData));
+
+        RequestData data = createRequestData(trustedCrypto);
+        assertFalse(validator.isValidatedLocally(createCredential(false, data), data));
+    }
+
+    /**
+     * An untrusted Assertion must never be treated as validated locally, even when a trusted
+     * Assertion is validated concurrently by the same STSTokenValidator.
+     */
+    @Test
+    public void testConcurrentTrustedAndUntrustedAssertions() throws Exception {
+        final STSTokenValidator validator = new STSTokenValidator();
+        final int iterations = 200;
+
+        final RequestData trustedData = createRequestData(trustedCrypto);
+        final Credential trustedCredential = createCredential(true, trustedData);
+        final RequestData untrustedData = createRequestData(untrustedCrypto);
+        final Credential untrustedCredential = createCredential(true, untrustedData);
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Callable<Boolean> trusted = new Callable<Boolean>() {
+                public Boolean call() throws Exception {
+                    boolean result = true;
+                    for (int i = 0; i < iterations; i++) {
+                        result &= validator.isValidatedLocally(trustedCredential, trustedData);
+                    }
+                    return result;
+                }
+            };
+            Callable<Boolean> untrusted = new Callable<Boolean>() {
+                public Boolean call() throws Exception {
+                    boolean result = false;
+                    for (int i = 0; i < iterations; i++) {
+                        result |= validator.isValidatedLocally(untrustedCredential, untrustedData);
+                    }
+                    return result;
+                }
+            };
+
+            Future<Boolean> trustedResult = executor.submit(trusted);
+            Future<Boolean> untrustedResult = executor.submit(untrusted);
+
+            assertTrue(trustedResult.get(60, TimeUnit.SECONDS));
+            assertFalse(untrustedResult.get(60, TimeUnit.SECONDS));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
 
     @Test
     public void testUsernameTokenHashCollisionIsNotCached() throws Exception {
@@ -274,6 +373,38 @@ public class STSTokenValidatorTest extends Assert {
         return assertion;
     }
 
+    private static RequestData createRequestData(Crypto sigCrypto) {
+        RequestData data = new RequestData();
+        data.setSigCrypto(sigCrypto);
+        data.setWssConfig(WSSConfig.getNewInstance());
+        return data;
+    }
+
+    private static Credential createCredential(boolean signed, RequestData data) throws Exception {
+        SAMLParms samlParms = new SAMLParms();
+        samlParms.setCallbackHandler(new SAML2CallbackHandler("alice", SAML2Constants.CONF_SENDER_VOUCHES));
+        AssertionWrapper assertion = new AssertionWrapper(samlParms);
+        if (signed) {
+            assertion.signAssertion("myalias", "myAliasPassword", signingCrypto, false);
+        }
+
+        // Round-trip the Assertion via DOM, as would happen on receipt of a message
+        Document doc = DOMUtils.createDocument();
+        Element element = assertion.toDOM(doc);
+        if (element.getParentNode() == null) {
+            // The Assertion must be attached to the Document so that the signature Reference can be resolved
+            doc.appendChild(element);
+        }
+        AssertionWrapper receivedAssertion = new AssertionWrapper(element);
+        if (signed) {
+            receivedAssertion.verifySignature(data, new WSDocInfo(doc));
+        }
+
+        Credential credential = new Credential();
+        credential.setAssertion(receivedAssertion);
+        return credential;
+    }
+
     /**
      * A mock STSClient, that only accepts the given token, and returns a SAML Assertion for it.
      */
@@ -309,9 +440,15 @@ public class STSTokenValidatorTest extends Assert {
     private static final class SAML2CallbackHandler implements CallbackHandler {
 
         private final String subjectName;
+        private final String confirmationMethod;
 
         SAML2CallbackHandler(String subjectName) {
+            this(subjectName, SAML2Constants.CONF_BEARER);
+        }
+
+        SAML2CallbackHandler(String subjectName, String confirmationMethod) {
             this.subjectName = subjectName;
+            this.confirmationMethod = confirmationMethod;
         }
 
         public void handle(Callback[] callbacks) throws IOException, UnsupportedCallbackException {
@@ -320,7 +457,7 @@ public class STSTokenValidatorTest extends Assert {
                     SAMLCallback samlCallback = (SAMLCallback)callback;
                     samlCallback.setSamlVersion(SAMLVersion.VERSION_20);
                     samlCallback.setIssuer("sts");
-                    samlCallback.setSubject(new SubjectBean(subjectName, null, SAML2Constants.CONF_BEARER));
+                    samlCallback.setSubject(new SubjectBean(subjectName, null, confirmationMethod));
 
                     AuthenticationStatementBean authBean = new AuthenticationStatementBean();
                     authBean.setAuthenticationMethod("Password");

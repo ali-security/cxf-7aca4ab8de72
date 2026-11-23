@@ -41,7 +41,6 @@ import org.apache.ws.security.validate.Validator;
  * 
  */
 public class STSTokenValidator implements Validator {
-    private STSSamlAssertionValidator samlValidator = new STSSamlAssertionValidator();
     private boolean alwaysValidateToSts;
     
     public STSTokenValidator() {
@@ -145,6 +144,9 @@ public class STSTokenValidator implements Validator {
         
         if (!alwaysValidateToSts && credential.getAssertion() != null) {
             try {
+                // STSSamlAssertionValidator records the trust verification result in an instance field, so
+                // a new instance must be used for each request to avoid sharing state between requests
+                STSSamlAssertionValidator samlValidator = new STSSamlAssertionValidator();
                 samlValidator.validate(credential, data);
                 return samlValidator.isTrustVerificationSucceeded();
             } catch (RuntimeException e) {
