@@ -19,7 +19,6 @@
 
 package org.apache.cxf.ws.security.trust;
 
-import java.util.Arrays;
 import java.util.List;
 import org.w3c.dom.Element;
 
@@ -31,6 +30,7 @@ import org.apache.cxf.ws.security.SecurityConstants;
 import org.apache.cxf.ws.security.tokenstore.SecurityToken;
 import org.apache.cxf.ws.security.tokenstore.TokenStore;
 import org.apache.cxf.ws.security.tokenstore.TokenStoreFactory;
+import org.apache.cxf.ws.security.tokenstore.TokenStoreUtils;
 import org.apache.ws.security.WSSecurityException;
 import org.apache.ws.security.handler.RequestData;
 import org.apache.ws.security.saml.ext.AssertionWrapper;
@@ -69,36 +69,32 @@ public class STSTokenValidator implements Validator {
         try {
             SecurityToken token = new SecurityToken();
             Element tokenElement = null;
-            int hash = 0;
+            String cacheKey = null;
             if (credential.getAssertion() != null) {
                 AssertionWrapper assertion = credential.getAssertion();
-                byte[] signatureValue = assertion.getSignatureValue();
-                if (signatureValue != null && signatureValue.length > 0) {
-                    hash = Arrays.hashCode(signatureValue);
-                }
-                tokenElement = credential.getAssertion().getElement();
+                cacheKey = TokenStoreUtils.getCacheKey(assertion);
+                tokenElement = assertion.getElement();
             } else if (credential.getUsernametoken() != null) {
                 tokenElement = credential.getUsernametoken().getElement();
-                hash = credential.getUsernametoken().hashCode();
+                cacheKey = TokenStoreUtils.getCacheKey(credential.getUsernametoken());
             } else if (credential.getBinarySecurityToken() != null) {
                 tokenElement = credential.getBinarySecurityToken().getElement();
-                hash = credential.getBinarySecurityToken().hashCode();
+                cacheKey = TokenStoreUtils.getCacheKey(credential.getBinarySecurityToken());
             } else if (credential.getSecurityContextToken() != null) {
                 tokenElement = credential.getSecurityContextToken().getElement();
-                hash = credential.getSecurityContextToken().hashCode();
+                cacheKey = TokenStoreUtils.getCacheKey(credential.getSecurityContextToken());
             }
             token.setToken(tokenElement);
             
             TokenStore tokenStore = getTokenStore(message);
-            if (tokenStore != null && hash != 0) {
-                SecurityToken transformedToken = getTransformedToken(tokenStore, hash);
+            if (tokenStore != null && cacheKey != null) {
+                SecurityToken transformedToken = getTransformedToken(tokenStore, cacheKey);
                 if (transformedToken != null) {
                     AssertionWrapper assertion = new AssertionWrapper(transformedToken.getToken());
                     credential.setTransformedToken(assertion);
                     return credential;
                 }
             }
-            token.setTokenHash(hash);
             
             STSClient c = STSUtils.getClient(message, "sts");
             synchronized (c) {
@@ -108,10 +104,10 @@ public class STSTokenValidator implements Validator {
                 if (returnedToken != token) {
                     AssertionWrapper assertion = new AssertionWrapper(returnedToken.getToken());
                     credential.setTransformedToken(assertion);
-                    if (hash != 0) {
+                    if (cacheKey != null) {
                         tokenStore.add(returnedToken);
                         token.setTransformedTokenIdentifier(returnedToken.getId());
-                        tokenStore.add(Integer.toString(hash), token);
+                        tokenStore.add(cacheKey, token);
                     }
                 }
                 return credential;
@@ -160,9 +156,9 @@ public class STSTokenValidator implements Validator {
         return false;
     }
 
-    private SecurityToken getTransformedToken(TokenStore tokenStore, int hash) {
-        SecurityToken recoveredToken = tokenStore.getToken(Integer.toString(hash));
-        if (recoveredToken != null && recoveredToken.getTokenHash() == hash) {
+    private SecurityToken getTransformedToken(TokenStore tokenStore, String cacheKey) {
+        SecurityToken recoveredToken = tokenStore.getToken(cacheKey);
+        if (recoveredToken != null) {
             String transformedTokenId = recoveredToken.getTransformedTokenIdentifier();
             if (transformedTokenId != null) {
                 return tokenStore.getToken(transformedTokenId);
