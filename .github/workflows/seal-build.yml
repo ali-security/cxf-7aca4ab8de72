@@ -1,0 +1,169 @@
+name: seal-build
+
+# Authored for the sealed build: upstream Apache CXF 2.7.18 ships no GitHub
+# Actions CI. Mirrors BUILDING.txt (`mvn` = compile + run all tests) on the JDK
+# the release was built with (Build-Jdk 1.7.0_71, cxf.jdk.version 1.6 target),
+# scoped to cxf-rt-ws-security plus the modules/system tests covering the
+# paths later CVE patches touch (rt/ws/security, services/sts/sts-core,
+# services/sts/systests/advanced).
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suites"
+        required: false
+        default: ""
+
+env:
+  # The STS test keystores (services/sts/**/src/test/resources/*.jks) hold
+  # certificates valid 2011-02..2021-02, so WS-Security signature/trust
+  # validation fails on today's clock. The STS test steps run under
+  # libfaketime with the clock starting at the release date (Oct 2015).
+  FAKETIME_CLOCK: "@2015-11-01 00:00:00"
+  MAVEN_OPTS: "-Xmx2g -XX:MaxPermSize=512m"
+  # Static-analysis gates (checkstyle/PMD from the default `sourcecheck`
+  # profile) are not tests and are switched off here; tests all run.
+  MVN_FLAGS: "-B -e -Dmaven.javadoc.skip=true -Dmaven.source.skip=true -Dgpg.skip=true -Dcheckstyle.skip=true -Dpmd.skip=true -Dcpd.skip=true"
+
+jobs:
+  ws-security-and-sts-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Oracle JDK 1.7.0_80 (release was built on Oracle 1.7.0_71)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://repo.huaweicloud.com/java/jdk/7u80-b15/jdk-7u80-linux-x64.tar.gz
+          echo "bad9a731639655118740bee119139c1ed019737ec802a630dd7ad7aab4309623  jdk-7u80-linux-x64.tar.gz" | sha256sum -c -
+          tar -xzf jdk-7u80-linux-x64.tar.gz
+          echo "JAVA_HOME=$RUNNER_TEMP/jdk1.7.0_80" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/jdk1.7.0_80/bin" >> "$GITHUB_PATH"
+
+      - name: Install libfaketime (STS test certificates expired in 2021)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q faketime
+          ls -l /usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1
+
+      - name: Install Maven 3.3.9 and HTTP Central mirror
+        run: |
+          set -euo pipefail
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.3.9/binaries/apache-maven-3.3.9-bin.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-3.3.9/bin" >> "$GITHUB_PATH"
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-http</id>
+                <mirrorOf>*</mirrorOf>
+                <url>http://insecure.repo1.maven.org/maven2</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+
+      - name: Build and test cxf-rt-ws-security
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -euo pipefail
+          java -version
+          mvn -version
+          if [ -n "$TEST_FILTER" ]; then
+            mvn clean install -pl rt/ws/security $MVN_FLAGS -Dtest="$TEST_FILTER" -DfailIfNoTests=false
+          else
+            mvn clean install -pl rt/ws/security $MVN_FLAGS
+          fi
+
+      - name: Upload cxf-rt-ws-security jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: cxf-rt-ws-security
+          path: rt/ws/security/target/cxf-rt-ws-security-2.7.18.jar
+          if-no-files-found: error
+
+      - name: Build and test STS core (against the cxf-rt-ws-security just built)
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -euo pipefail
+          export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1 FAKETIME="$FAKETIME_CLOCK" DONT_FAKE_MONOTONIC=1
+          date
+          if [ -n "$TEST_FILTER" ]; then
+            mvn install -pl services/sts/sts-core $MVN_FLAGS -Dtest="$TEST_FILTER" -DfailIfNoTests=false
+          else
+            mvn install -pl services/sts/sts-core $MVN_FLAGS
+          fi
+
+      - name: Surefire summary
+        if: always()
+        run: python3 .github/workflows/seal-surefire-summary.py rt services
+
+  sts-systests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Oracle JDK 1.7.0_80 (release was built on Oracle 1.7.0_71)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://repo.huaweicloud.com/java/jdk/7u80-b15/jdk-7u80-linux-x64.tar.gz
+          echo "bad9a731639655118740bee119139c1ed019737ec802a630dd7ad7aab4309623  jdk-7u80-linux-x64.tar.gz" | sha256sum -c -
+          tar -xzf jdk-7u80-linux-x64.tar.gz
+          echo "JAVA_HOME=$RUNNER_TEMP/jdk1.7.0_80" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/jdk1.7.0_80/bin" >> "$GITHUB_PATH"
+
+      - name: Install libfaketime (STS test certificates expired in 2021)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q faketime
+          ls -l /usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1
+
+      - name: Install Maven 3.3.9 and HTTP Central mirror
+        run: |
+          set -euo pipefail
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.3.9/binaries/apache-maven-3.3.9-bin.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-3.3.9/bin" >> "$GITHUB_PATH"
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-http</id>
+                <mirrorOf>*</mirrorOf>
+                <url>http://insecure.repo1.maven.org/maven2</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+
+      - name: Install ws-security, sts-core and testutils from source (unit tests run in the other job)
+        run: |
+          set -euo pipefail
+          mvn clean install -pl testutils,rt/ws/security,services/sts/sts-core $MVN_FLAGS -DskipTests
+
+      - name: STS advanced system tests (distributed_caching covers the patched paths)
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -euo pipefail
+          export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1 FAKETIME="$FAKETIME_CLOCK" DONT_FAKE_MONOTONIC=1
+          date
+          if [ -n "$TEST_FILTER" ]; then
+            mvn test -pl services/sts/systests/advanced $MVN_FLAGS -Dtest="$TEST_FILTER" -DfailIfNoTests=false
+          else
+            mvn test -pl services/sts/systests/advanced $MVN_FLAGS
+          fi
+
+      - name: Surefire summary
+        if: always()
+        run: python3 .github/workflows/seal-surefire-summary.py services
